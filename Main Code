@@ -1,0 +1,363 @@
+#include "EEPROM.h"
+#include "PinChangeInt.h"
+
+#define XAXIS 0
+#define YAXIS 1
+#define ZAXIS 2
+
+#define ATTITUDE_XAXIS_PID_IDX 0
+#define ATTITUDE_YAXIS_PID_IDX 1
+#define RATE_XAXIS_PID_IDX 2
+#define RATE_YAXIS_PID_IDX 3
+#define ZAXIS_PID_IDX 4
+
+long accelSample[3]={0,0,0};
+float accelScaleFactor[3] = {0.0,0.0,0.0};
+float runTimeAccelBias[3] = {0, 0, 0};
+byte accelSampleCount = 0;
+unsigned long previousTime = 0;
+unsigned long currentTime = 0;
+unsigned long deltaTime = 0;
+int motorAxisCommandRoll = 0;        
+int motorAxisCommandPitch = 0;
+int motorAxisCommandYaw = 0;
+float kinematicsAngle[3] = {0.0,0.0,0.0};
+boolean inFlight = false;                                           // true when motor are armed and that the user pass one time the min throttle
+#ifdef CHANGE_YAW_DIRECTION
+  #define YAW_DIRECTION -1
+#else
+  #define YAW_DIRECTION 1
+#endif
+/////////////////////////////////////////////////////////////////////////////////////////////////////
+struct PIDdata
+{
+  float P, I, D;
+  float lastError;
+  float previousPIDTime;
+  float integratedError;
+  float windupGuard;
+} PID[5];
+
+///////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+
+#define DEBUG_RECEIVER
+
+#define AILERON  0   //roll
+#define ELEVATOR 1   //pitch
+#define THROTTLE 2
+#define RUDDER   3   //yaw
+
+#define AILERON_IN  10          // These are the pins configured for the receiver
+#define ELEVATOR_IN 11
+#define THROTTLE_IN 12
+#define RUDDER_IN   13
+
+uint8_t rc_pins[4] = {AILERON_IN, ELEVATOR_IN, THROTTLE_IN, RUDDER_IN};
+uint8_t rc_flags[4] = {1, 2, 4, 8};
+float rc_values[4] = {0, 0, 0, 0};
+
+volatile uint8_t rc_shared_flags;
+volatile uint16_t rc_shared_values[4];
+volatile uint32_t rc_shared_ts[4];
+
+void rc_channel_change(uint8_t id) {
+  if (digitalRead(rc_pins[id]) == HIGH) {
+    rc_shared_ts[id] = micros();
+  }
+  else {
+    rc_shared_values[id] = (uint16_t)(micros() - rc_shared_ts[id]);
+    rc_shared_flags |= rc_flags[id];
+  }
+}
+
+void rc_aileron_change()  { rc_channel_change(AILERON);  }
+void rc_elevator_change() { rc_channel_change(ELEVATOR); }
+void rc_throttle_change() { rc_channel_change(THROTTLE); }
+void rc_rudder_change()   { rc_channel_change(RUDDER);   }
+
+void rc_setup_interrupts() {
+  PCintPort::attachInterrupt(rc_pins[AILERON],  &rc_aileron_change, CHANGE);        // Attaching the PWM pins to work as Pin change Interrupt
+  PCintPort::attachInterrupt(rc_pins[ELEVATOR], &rc_elevator_change, CHANGE);
+  PCintPort::attachInterrupt(rc_pins[THROTTLE], &rc_throttle_change, CHANGE);
+  PCintPort::attachInterrupt(rc_pins[RUDDER],   &rc_rudder_change, CHANGE);
+}
+
+  static uint8_t flags;
+  
+void rc_process_channels() {
+  
+  if (rc_shared_flags) {
+   noInterrupts();
+    flags = rc_shared_flags;
+    
+    if (flags & rc_flags[0]) rc_values[0] = rc_shared_values[0];
+    if (flags & rc_flags[1]) rc_values[1] = rc_shared_values[1];
+    if (flags & rc_flags[2]) rc_values[2] = rc_shared_values[2];
+    if (flags & rc_flags[3]) rc_values[3] = rc_shared_values[3];
+    rc_shared_flags = 0;
+    interrupts(); 
+  }
+
+  flags = 0;
+}
+
+#ifdef DEBUG_RECEIVER
+void rc_print_channels() {
+  static char str[64];
+ 
+  sprintf(str, "AILE: %d, ELEV: %d, THRO: %d, RUDD: %d    ",
+    rc_values[0], rc_values[1], rc_values[2], rc_values[3]
+  );
+ 
+  Serial.print(str); 
+}
+#endif
+
+///////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+float receiverZero[3] = {1518,1500,1372};   //Mean Transmitter values Aileron Elevator Rudder
+#define PWM2RAD 0.002                     //this connverts the receiver value to the radian value
+#define ATTITUDE_SCALING (0.75 * PWM2RAD) //this is used to set the sensitivity of the output signal
+float gyroRate[3] = {0.0,0.0,0.0};        //to store the angular velocities
+int motorCommand[4] = {0,0,0,0};          //to send signal to the motors
+#define MOTOR1 0
+#define MOTOR2 1
+#define MOTOR3 2
+#define MOTOR4 3
+#define FRONT MOTOR1
+#define REAR  MOTOR2
+#define RIGHT MOTOR3
+#define LEFT  MOTOR4
+int throttle = 1000;
+int angle=0;
+int angles[4];
+
+void initializePID(void){
+  PID[RATE_XAXIS_PID_IDX].P = 1.0;
+  PID[RATE_XAXIS_PID_IDX].I = 0.0;
+  PID[RATE_XAXIS_PID_IDX].D = 0.0;
+  PID[RATE_XAXIS_PID_IDX].windupGuard = 200;
+  PID[RATE_YAXIS_PID_IDX].P = 1.0;
+  PID[RATE_YAXIS_PID_IDX].I = 0.0;
+  PID[RATE_YAXIS_PID_IDX].D = 0.0;
+  PID[RATE_YAXIS_PID_IDX].windupGuard = 200;
+  PID[ATTITUDE_XAXIS_PID_IDX].P = 3.5;
+  PID[ATTITUDE_XAXIS_PID_IDX].I = 0.0;
+  PID[ATTITUDE_XAXIS_PID_IDX].D = 0.0;
+  PID[ATTITUDE_YAXIS_PID_IDX].P = 3.5;
+  PID[ATTITUDE_YAXIS_PID_IDX].I = 0.0;
+  PID[ATTITUDE_YAXIS_PID_IDX].D = 0.0;
+  PID[ZAXIS_PID_IDX].P = 1.0;
+  PID[ZAXIS_PID_IDX].I = 0.0;
+  PID[ZAXIS_PID_IDX].D = 0.0;
+  PID[ZAXIS_PID_IDX].windupGuard = 100;
+}
+
+float IMU[6] = {0.0, 0.0, 0.0,0.1,0.25,0.3};        //To store the IMU output
+//////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+#define TIMEOUT 10
+
+// { roll, pitch, yaw }
+
+char read_char() {
+  unsigned long starttime = millis();
+  do {
+    if(Serial1.available() > 0)
+      return((char)Serial1.read());
+  } while((millis() - starttime) < TIMEOUT);
+  return NULL;
+}
+
+void get_angles() {
+  for(int n=0; n<6; n++) {
+    char buffer[30];
+    int received = 0;
+    char ch;
+    do {
+      if((ch = read_char()) == NULL) return;
+    } while(ch != ',' && ch != '\r' && (buffer[received++] = ch));   
+    buffer[received] = '\0';
+    IMU[n] = atof(buffer);
+  }
+}
+
+void read_9dofahrs() {                            //Reading the IMU Data
+  char beginstr[6] = {'#','Y','P','R','=','\0'};
+  for(int i=0; i<5; i++)
+    if(read_char() != beginstr[i]) return;
+  get_angles();
+}
+///////////////////////////////////////////////////////////////////////////////////////////////////////////
+
+  #define MOTORPIN0    2
+  #define MOTORPIN1    3
+  #define MOTORPIN2    5
+  #define MOTORPIN3    6
+
+
+
+
+
+
+
+
+
+
+
+////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+
+
+float windupGuard; //Read in from EEPROM. Check this from EEPROM
+
+
+float updatePID(float targetPosition, float currentPosition, struct PIDdata *PIDparameters) 
+{
+  const float deltaPIDTime = (currentTime - PIDparameters->previousPIDTime) / 1000000.0;
+  PIDparameters->previousPIDTime = currentTime;
+  float error = targetPosition - currentPosition;
+  if (inFlight) 
+  {
+    PIDparameters->integratedError += error * deltaPIDTime;
+  }
+  else 
+  {
+    PIDparameters->integratedError = 0.0;
+  }
+
+  PIDparameters->integratedError = constrain(PIDparameters->integratedError, -PIDparameters->windupGuard, PIDparameters->windupGuard);
+  float dTerm = PIDparameters->D * (currentPosition - PIDparameters->lastError) / (deltaPIDTime * 100);
+  PIDparameters->lastError = currentPosition;
+  return (PIDparameters->P * error) + (PIDparameters->I * PIDparameters->integratedError) + dTerm;
+}
+///////////////////////////////////////////////////////////////////////////////////////////////////////////////
+void calculateFlightError()      //Update PID Output    updatePID(Target Position,Current Position,PID Parameters)
+{     float tposition = rc_values[0] - receiverZero[XAXIS]; 
+    motorAxisCommandRoll   = updatePID(rc_values[0] - receiverZero[XAXIS], IMU[3], &PID[RATE_XAXIS_PID_IDX]);
+    motorAxisCommandPitch  = updatePID((rc_values[1]-receiverZero[YAXIS]), -IMU[4], &PID[RATE_YAXIS_PID_IDX]);
+    motorAxisCommandYaw    = updatePID(rc_values[3]-receiverZero[ZAXIS], IMU[5], &PID[ZAXIS_PID_IDX]);
+//Serial.print("    YAw");Serial.print(motorAxisCommandYaw);Serial.print("   Roll  ");Serial.print(motorAxisCommandRoll);
+}
+
+void applyMotorCommand() 
+{
+  throttle = rc_values[THROTTLE];
+  motorCommand[FRONT] = throttle - motorAxisCommandPitch - (YAW_DIRECTION * motorAxisCommandYaw);
+  motorCommand[REAR] =  throttle + motorAxisCommandPitch - (YAW_DIRECTION * motorAxisCommandYaw);
+  motorCommand[RIGHT] = throttle - motorAxisCommandRoll  + (YAW_DIRECTION * motorAxisCommandYaw);
+  motorCommand[LEFT] =  throttle + motorAxisCommandRoll  + (YAW_DIRECTION * motorAxisCommandYaw);
+  for(int num=0;num<4;num++)
+  {motorCommand[num]=constrain(motorCommand[num],1100,1900);}
+Serial.print(motorCommand[FRONT]); Serial.print("   ");Serial.print(motorCommand[REAR]);Serial.print("   ");Serial.print(motorCommand[RIGHT]);Serial.print("   ");Serial.print(motorCommand[LEFT]);Serial.print("   ");
+}
+
+void write_Motors()                                            //Change this if not working with a PPM signal
+{
+  analogWrite(MOTORPIN0, motorCommand[MOTOR1] / 8);
+  analogWrite(MOTORPIN1, motorCommand[MOTOR2] / 8);
+  analogWrite(MOTORPIN2, motorCommand[MOTOR3] / 8);
+  analogWrite(MOTORPIN3, motorCommand[MOTOR4] / 8); 
+}  
+
+void evaluateGyroRate()                          //Use this if Using lower precision IMU
+{
+  
+}
+
+void processFlightControl()
+{
+  calculateFlightError();
+}
+
+
+
+void processTask()
+{
+  evaluateGyroRate();
+  processFlightControl();
+  applyMotorCommand();
+  write_Motors();   
+}
+
+void measureSensors()
+{
+ read_9dofahrs();
+}
+
+void arm()                                                    // Attach the Motors to the PWM pins
+{
+    pinMode(MOTORPIN0, OUTPUT);
+    pinMode(MOTORPIN1, OUTPUT);
+    pinMode(MOTORPIN2, OUTPUT);
+    pinMode(MOTORPIN3, OUTPUT);
+
+}
+
+void cycle()                                             // To check if the motors are attached
+{
+  Serial.print("Cycle ESC Number ");
+  for(int esc = 0; esc < 4; esc++) 
+  {
+    //To check whether the motors are mounted or not
+  }
+  Serial.println("");
+}
+
+void setup()
+{
+  Serial1.begin(57600);                                  //Communicate with the IMU
+  previousTime = micros();
+  #ifdef DEBUG_RECEIVER
+  Serial.begin(9600);                                    // With the system
+  #endif
+  rc_setup_interrupts();
+  delay(1000);
+  Serial.begin(9600);
+  Serial.println("Wait for your input! [s] to init...");
+  while(Serial.available() <= 0)
+    delay(1000);
+  int incomingByte = Serial.read();
+
+  Serial.println("Start the system...");
+  arm();
+  delay(5000);
+  if(incomingByte == 115) 
+  {
+    Serial.println("Traverses all angles upward and downward.");  
+    cycle();
+    delay(1000);
+  }
+  Serial.println("Start loop...");
+ initializePID();  
+}
+
+void loop()
+{
+ #ifdef DEBUG_RECEIVER
+    rc_process_channels();
+  currentTime = micros();
+  deltaTime = currentTime - previousTime;
+    if (deltaTime >= 10000) 
+    {
+      measureSensors();
+      processTask();
+     Serial.println(deltaTime/1000);
+    }   
+  #endif 
+  previousTime = currentTime;
+ /*   Serial.print("Angles:");
+  Serial.print(IMU[0]);Serial.print(" | ");
+  Serial.print(IMU[1]);Serial.print(" | ");
+  Serial.print(IMU[2]);Serial.print(" ");
+  Serial.print("Gyrorate:");
+  Serial.print(IMU[3]);Serial.print(" | ");
+  Serial.print(IMU[4]);Serial.print(" | ");
+  Serial.print(IMU[5]);Serial.print(" ");
+  Serial.print(motorAxisCommandRoll);Serial.print(" | ");
+  Serial.print(motorAxisCommandPitch);Serial.print(" | ");
+  Serial.print(motorAxisCommandYaw);Serial.print("            ");
+  Serial.print(PID[RATE_XAXIS_PID_IDX].P);Serial.print(" | ");
+  Serial.print(PID[RATE_XAXIS_PID_IDX].lastError);Serial.print(" | ");
+  Serial.print(PID[RATE_XAXIS_PID_IDX].previousPIDTime);Serial.print(" | ");
+  Serial.print(PID[RATE_XAXIS_PID_IDX].integratedError);Serial.print(" | ");
+  Serial.print(PID[RATE_XAXIS_PID_IDX].windupGuard);Serial.println("");*/
+
+}
